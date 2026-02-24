@@ -1,0 +1,23 @@
+{
+  "name": "ynab-like",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test",
+    "prisma:generate": "prisma generate",
+    "prisma:db-push": "prisma db push",
+    "dev": "nodemon src/server.js"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.17.0",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "prisma": "^5.17.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.10",
+    "nodemon": "^3.1.9"
+  }
+}
