@@ -1,102 +1,166 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import jwt from 'jsonwebtoken';
+import request from 'supertest';
 
-import { prisma } from '../src/db.js';
 import { assignMoney } from '../src/budget-engine.js';
-import { createAuthHandler, verifyJwt } from '../src/api/auth.js';
-import { createAccountsHandler } from '../src/api/accounts.js';
-import { createCategoriesHandler } from '../src/api/categories.js';
+import { createApp } from '../src/server.js';
+import { prisma } from '../src/db.js';
+
+function buildMockPrisma() {
+  const users = [];
+  const accounts = [];
+  const budgets = [];
+  const categories = [];
+  const transactions = [];
+
+  const findBudget = (userId, month) => budgets.find((b) => b.userId === userId && b.month.toISOString() === month.toISOString()) ?? null;
+
+  prisma.user.findUnique = async ({ where }) => users.find((u) => u.email === where.email) ?? null;
+  prisma.user.create = async ({ data, select }) => {
+    const row = { id: `u${users.length + 1}`, email: data.email, password: data.password, createdAt: new Date() };
+    users.push(row);
+    if (!select) return row;
+    return { id: row.id, email: row.email, createdAt: row.createdAt };
+  };
+
+  prisma.account.findMany = async ({ where }) => accounts.filter((a) => a.userId === where.userId);
+  prisma.transaction.findMany = async ({ where }) => transactions.filter((t) => {
+    const account = accounts.find((a) => a.id === t.accountId);
+    if (!account || account.userId !== where.account.userId) return false;
+    if (where.accountId && t.accountId !== where.accountId) return false;
+    if (where.categoryId && t.categoryId !== where.categoryId) return false;
+    return true;
+  });
+  prisma.transaction.count = async ({ where }) => (await prisma.transaction.findMany({ where })).length;
+
+  prisma.$transaction = async (arg) => {
+    if (Array.isArray(arg)) return Promise.all(arg);
+    return arg({
+      account: {
+        create: async ({ data }) => {
+          const row = { id: `a${accounts.length + 1}`, ...data };
+          accounts.push(row);
+          return row;
+        },
+        findFirst: async ({ where }) => accounts.find((a) => a.id === where.id && a.userId === where.userId) ?? null,
+        update: async ({ where, data }) => {
+          const row = accounts.find((a) => a.id === where.id);
+          if (data.balance?.decrement !== undefined) row.balance -= data.balance.decrement;
+          if (data.balance?.increment !== undefined) row.balance += data.balance.increment;
+          if (typeof data.balance === 'number') row.balance = data.balance;
+          if (data.name) row.name = data.name;
+          return row;
+        }
+      },
+      budgetMonth: {
+        findUnique: async ({ where }) => {
+          if (where.userId_month) return findBudget(where.userId_month.userId, where.userId_month.month);
+          return budgets.find((b) => b.id === where.id) ?? null;
+        },
+        upsert: async ({ where, create }) => {
+          const existing = findBudget(where.userId_month.userId, where.userId_month.month);
+          if (existing) return existing;
+          const row = { id: `b${budgets.length + 1}`, availableToBudget: 0, carryoverFromPrev: 0, ...create };
+          budgets.push(row);
+          return row;
+        },
+        update: async ({ where, data }) => {
+          const row = budgets.find((b) => b.id === where.id);
+          Object.assign(row, data);
+          return row;
+        }
+      },
+      category: {
+        create: async ({ data }) => {
+          const row = { id: `c${categories.length + 1}`, assigned: 0, spent: 0, ...data };
+          categories.push(row);
+          return row;
+        },
+        findFirst: async ({ where }) => categories.find((c) => {
+          if (where.id && c.id !== where.id) return false;
+          if (where.budgetMonthId && c.budgetMonthId !== where.budgetMonthId) return false;
+          if (where.budgetMonth?.userId) {
+            const budget = budgets.find((b) => b.id === c.budgetMonthId);
+            return budget?.userId === where.budgetMonth.userId;
+          }
+          return true;
+        }) ?? null,
+        update: async ({ where, data }) => {
+          const row = categories.find((c) => c.id === where.id);
+          if (data.assigned?.increment) row.assigned += data.assigned.increment;
+          if (data.spent?.increment) row.spent += data.spent.increment;
+          if (data.spent?.decrement) row.spent -= data.spent.decrement;
+          return row;
+        }
+      },
+      transaction: {
+        create: async ({ data }) => {
+          const row = { id: `t${transactions.length + 1}`, cleared: false, ...data };
+          transactions.push(row);
+          return row;
+        },
+        findFirst: async ({ where }) => transactions.find((t) => t.id === where.id && accounts.find((a) => a.id === t.accountId)?.userId === where.account.userId) ?? null,
+        update: async ({ where, data }) => {
+          const row = transactions.find((t) => t.id === where.id);
+          Object.assign(row, data);
+          return row;
+        },
+        delete: async ({ where }) => {
+          const idx = transactions.findIndex((t) => t.id === where.id);
+          transactions.splice(idx, 1);
+        }
+      }
+    });
+  };
+
+  return { accounts, categories, budgets };
+}
 
 test('assignMoney subtracts from availableToBudget', () => {
-  const result = assignMoney({ availableToBudget: 100, assigned: 40 });
-  assert.deepEqual(result, { assigned: 40, availableToBudget: 60 });
+  assert.deepEqual(assignMoney({ availableToBudget: 100, assigned: 40 }), { assigned: 40, availableToBudget: 60 });
 });
 
-test('auth register/login flow with mocked prisma', async () => {
-  const auth = createAuthHandler();
-  let stored;
+test('api flow: register -> account -> category assign -> transaction updates balances', async () => {
+  const state = buildMockPrisma();
+  const app = createApp();
 
-  prisma.user.findUnique = async ({ where }) => {
-    if (where.email === 'exists@example.com') return { id: 'u1', email: where.email, password: stored?.password };
-    if (where.email === 'new@example.com') return stored ?? null;
-    return null;
-  };
-  prisma.user.create = async ({ data }) => {
-    stored = { id: 'u2', email: data.email, password: data.password, createdAt: new Date() };
-    return { id: stored.id, email: stored.email, createdAt: stored.createdAt };
-  };
+  const register = await request(app).post('/api/auth/register').send({ email: 'test@example.com', password: 'password123' });
+  assert.equal(register.status, 201);
 
-  const reg = await auth.register({ email: 'new@example.com', password: 'password123' });
-  assert.equal(reg.status, 201);
+  const login = await request(app).post('/api/auth/login').send({ email: 'test@example.com', password: 'password123' });
+  const token = login.body.token;
+  assert.ok(token);
 
-  const login = await auth.login({ email: 'new@example.com', password: 'password123' });
-  assert.equal(login.status, 200);
-  assert.ok(login.body.token);
-});
+  const account = await request(app)
+    .post('/api/accounts')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ name: 'Checking', type: 'checking', balance: 100 });
+  assert.equal(account.status, 201);
 
-test('verifyJwt middleware sets req.user', () => {
-  const token = jwt.sign({ sub: 'u1' }, process.env.JWT_SECRET || 'dev-secret');
-  const req = { headers: { authorization: `Bearer ${token}` } };
-  let called = false;
-  const res = { status: () => ({ json: () => {} }) };
-  verifyJwt(req, res, () => {
-    called = true;
-  });
-  assert.equal(called, true);
-  assert.equal(req.user.sub, 'u1');
-});
+  const category = await request(app)
+    .post('/api/categories?month=2026-01')
+    .set('Authorization', `Bearer ${token}`)
+    .send({ name: 'Groceries' });
+  assert.equal(category.status, 201);
 
-test('accounts handler create/list/patch with mocked prisma', async () => {
-  const accounts = createAccountsHandler();
-  const rows = [];
+  const assigned = await request(app)
+    .post(`/api/categories/${category.body.id}/assign?month=2026-01`)
+    .set('Authorization', `Bearer ${token}`)
+    .send({ amount: 50 });
+  assert.equal(assigned.status, 200);
 
-  prisma.account.findMany = async () => rows;
-  prisma.$transaction = async (fn) => fn({
-    account: {
-      create: async ({ data }) => {
-        const row = { id: 'a1', ...data };
-        rows.push(row);
-        return row;
-      },
-      findFirst: async ({ where }) => rows.find((r) => r.id === where.id && r.userId === where.userId) ?? null,
-      update: async ({ where, data }) => {
-        const row = rows.find((r) => r.id === where.id);
-        Object.assign(row, data);
-        return row;
-      }
-    }
-  });
+  const tx = await request(app)
+    .post('/api/transactions')
+    .set('Authorization', `Bearer ${token}`)
+    .send({
+      accountId: account.body.id,
+      categoryId: category.body.id,
+      date: '2026-01-05T00:00:00.000Z',
+      amount: 20,
+      payee: 'Store'
+    });
+  assert.equal(tx.status, 201);
 
-  await accounts.create('u1', { name: 'Checking', type: 'checking', balance: 10 });
-  const list = await accounts.list('u1');
-  assert.equal(list.body.length, 1);
-
-  const patched = await accounts.patch('u1', 'a1', { name: 'Main Checking' });
-  assert.equal(patched.body.name, 'Main Checking');
-});
-
-test('categories assign updates budget and category via mocked prisma tx', async () => {
-  const categories = createCategoriesHandler();
-
-  const budget = { id: 'b1', userId: 'u1', month: new Date('2024-01-01T00:00:00.000Z'), availableToBudget: 100 };
-  const category = { id: 'c1', budgetMonthId: 'b1', assigned: 0 };
-
-  prisma.$transaction = async (fn) => fn({
-    budgetMonth: {
-      findUnique: async () => budget,
-      upsert: async () => budget,
-      update: async ({ data }) => ({ ...budget, ...data })
-    },
-    category: {
-      create: async ({ data }) => ({ id: 'c2', ...data }),
-      findFirst: async () => category,
-      update: async ({ data }) => ({ ...category, assigned: category.assigned + data.assigned.increment })
-    }
-  });
-
-  const result = await categories.assign('u1', '2024-01', 'c1', { amount: 20 });
-  assert.equal(result.status, 200);
-  assert.equal(Number(result.body.budgetMonth.availableToBudget), 80);
-  assert.equal(result.body.category.assigned, 20);
+  assert.equal(state.accounts[0].balance, 80);
+  assert.equal(state.categories[0].spent, 20);
 });
