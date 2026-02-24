@@ -1,6 +1,7 @@
 import { z } from 'zod';
 import { prisma } from '../db.js';
 import { assignMoney } from '../budget-engine.js';
+import { parseMonth } from '../utils/validation.js';
 
 const categoryCreateSchema = z.object({
   name: z.string().min(1),
@@ -11,11 +12,6 @@ const assignSchema = z.object({
   amount: z.number().nonnegative()
 });
 
-function parseMonth(monthString) {
-  const month = new Date(`${monthString}-01T00:00:00.000Z`);
-  if (Number.isNaN(month.getTime())) throw new Error('Invalid month format; expected YYYY-MM');
-  return month;
-}
 
 export function createCategoriesHandler() {
   return {
